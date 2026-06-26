@@ -26,6 +26,21 @@ func TestServer_ParseMetrics_ChatCompletions(t *testing.T) {
 	}
 }
 
+func TestServer_ParseMetrics_EstimatesRatesWithoutTimings(t *testing.T) {
+	body := `{"usage":{"prompt_tokens":12,"completion_tokens":7}}`
+	parsed := gjson.Parse(body)
+	entry, err := parseMetrics("m", time.Now().Add(-2*time.Second), parsed.Get("usage"), parsed.Get("timings"))
+	if err != nil {
+		t.Fatalf("parseMetrics: %v", err)
+	}
+	if entry.Tokens.PromptPerSecond < 5.9 || entry.Tokens.PromptPerSecond > 6.1 {
+		t.Fatalf("prompt rate = %f, want about 6", entry.Tokens.PromptPerSecond)
+	}
+	if entry.Tokens.TokensPerSecond < 3.4 || entry.Tokens.TokensPerSecond > 3.6 {
+		t.Fatalf("token rate = %f, want about 3.5", entry.Tokens.TokensPerSecond)
+	}
+}
+
 func TestServer_ParseMetrics_Timings(t *testing.T) {
 	body := `{"timings":{"prompt_n":20,"predicted_n":50,"prompt_per_second":100.0,"predicted_per_second":40.0,"prompt_ms":200,"predicted_ms":1250,"cache_n":8}}`
 	parsed := gjson.Parse(body)
@@ -57,14 +72,49 @@ func TestServer_ProcessStreamingResponse(t *testing.T) {
 	}
 }
 
+func TestServer_ProcessStreamingResponse_EstimatesRatesWithoutTimings(t *testing.T) {
+	body := []byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n" +
+		"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":8}}\n\n" +
+		"data: [DONE]\n\n")
+	entry, err := processStreamingResponse("m", time.Now().Add(-2*time.Second), body)
+	if err != nil {
+		t.Fatalf("processStreamingResponse: %v", err)
+	}
+	if entry.Tokens.InputTokens != 12 || entry.Tokens.OutputTokens != 8 {
+		t.Fatalf("tokens = %+v", entry.Tokens)
+	}
+	if entry.Tokens.PromptPerSecond <= 0 || entry.Tokens.TokensPerSecond <= 0 {
+		t.Fatalf("rates = %+v, want estimated positive rates", entry.Tokens)
+	}
+}
+
 func TestServer_ProcessStreamingResponse_NoData(t *testing.T) {
 	if _, err := processStreamingResponse("m", time.Now(), []byte("data: [DONE]\n\n")); err == nil {
 		t.Fatal("expected error for stream with no usage data")
 	}
 }
 
+func TestMetricsMonitor_QueueMetrics_ResolvesFirstAlias(t *testing.T) {
+	mm := newMetricsMonitor(config.Config{Models: map[string]config.ModelConfig{
+		"real": {Aliases: []string{"alias", "second-alias"}},
+	}}, nil, 10, 0)
+
+	id := mm.queueMetrics(ActivityLogEntry{Model: "real"})
+
+	entries := mm.getMetrics()
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	if entries[0].ID != id {
+		t.Fatalf("id = %d, want %d", entries[0].ID, id)
+	}
+	if entries[0].Model != "alias" {
+		t.Fatalf("model = %q, want first alias", entries[0].Model)
+	}
+}
+
 func TestMetricsMonitor_RecordMetadata(t *testing.T) {
-	mm := newMetricsMonitor(nil, 10, 0)
+	mm := newMetricsMonitor(config.Config{}, nil, 10, 0)
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"usage":{}}`))
 	r = r.WithContext(shared.SetContext(r.Context(), shared.ReqContextData{
 		ModelID:  "m",
@@ -76,7 +126,7 @@ func TestMetricsMonitor_RecordMetadata(t *testing.T) {
 	copier.WriteHeader(http.StatusOK)
 	copier.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2}}`))
 
-	mm.record("m", r, copier, 0, nil, nil)
+	mm.record("m", copier.StartTime(), r, copier, 0, nil, nil)
 
 	entries := mm.getMetrics()
 	if len(entries) != 1 {
@@ -91,7 +141,7 @@ func TestMetricsMonitor_RecordMetadata(t *testing.T) {
 }
 
 func TestMetricsMonitor_RecordFailedRequestCapture(t *testing.T) {
-	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), 10, 5)
+	mm := newMetricsMonitor(config.Config{}, logmon.NewWriter(io.Discard), 10, 5)
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 	reqHeaders := map[string]string{"content-type": "application/json"}
 
@@ -102,7 +152,7 @@ func TestMetricsMonitor_RecordFailedRequestCapture(t *testing.T) {
 	copier.Write([]byte(`{"error":{"message":"model unavailable"}}`))
 
 	reqBody := []byte(`{"model":"m","messages":[]}`)
-	mm.record("m", r, copier, captureAll, reqBody, reqHeaders)
+	mm.record("m", copier.StartTime(), r, copier, captureAll, reqBody, reqHeaders)
 
 	entries := mm.getMetrics()
 	if len(entries) != 1 {
@@ -136,7 +186,7 @@ func TestMetricsMonitor_RecordFailedRequestCapture(t *testing.T) {
 
 func TestMetricsMonitor_RecordFailedRequestStatusFallback(t *testing.T) {
 	// Non-JSON error body: ErrorMsg falls back to the HTTP status text.
-	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), 10, 5)
+	mm := newMetricsMonitor(config.Config{}, logmon.NewWriter(io.Discard), 10, 5)
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
 	w := httptest.NewRecorder()
@@ -144,7 +194,7 @@ func TestMetricsMonitor_RecordFailedRequestStatusFallback(t *testing.T) {
 	copier.WriteHeader(http.StatusBadGateway)
 	copier.Write([]byte("<html>upstream down</html>"))
 
-	mm.record("m", r, copier, captureAll, nil, nil)
+	mm.record("m", copier.StartTime(), r, copier, captureAll, nil, nil)
 
 	entries := mm.getMetrics()
 	if len(entries) != 1 {
@@ -156,7 +206,7 @@ func TestMetricsMonitor_RecordFailedRequestStatusFallback(t *testing.T) {
 }
 
 func TestMetricsMonitor_RecordFailedRequestCaptureDisabled(t *testing.T) {
-	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), 10, 0) // captures disabled
+	mm := newMetricsMonitor(config.Config{}, logmon.NewWriter(io.Discard), 10, 0) // captures disabled
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
 	w := httptest.NewRecorder()
@@ -164,7 +214,7 @@ func TestMetricsMonitor_RecordFailedRequestCaptureDisabled(t *testing.T) {
 	copier.WriteHeader(http.StatusInternalServerError)
 	copier.Write([]byte(`{"error":"boom"}`))
 
-	mm.record("m", r, copier, captureAll, []byte("req"), nil)
+	mm.record("m", copier.StartTime(), r, copier, captureAll, []byte("req"), nil)
 
 	entries := mm.getMetrics()
 	if len(entries) != 1 {
@@ -183,7 +233,7 @@ func TestMetricsMonitor_RecordFailedRequestCaptureDisabled(t *testing.T) {
 }
 
 func TestMetricsMonitor_RecordDecompressionFailureSetsErrorMsg(t *testing.T) {
-	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), 10, 5)
+	mm := newMetricsMonitor(config.Config{}, logmon.NewWriter(io.Discard), 10, 5)
 	r := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", nil)
 
 	w := httptest.NewRecorder()
@@ -192,7 +242,7 @@ func TestMetricsMonitor_RecordDecompressionFailureSetsErrorMsg(t *testing.T) {
 	copier.WriteHeader(http.StatusOK)
 	copier.Write([]byte("not-really-gzip"))
 
-	mm.record("m", r, copier, captureAll, []byte("req"), nil)
+	mm.record("m", copier.StartTime(), r, copier, captureAll, []byte("req"), nil)
 
 	entries := mm.getMetrics()
 	if len(entries) != 1 {
@@ -208,7 +258,7 @@ func TestMetricsMonitor_RecordDecompressionFailureSetsErrorMsg(t *testing.T) {
 }
 
 func TestMetricsMonitor_DecodeResponseBody(t *testing.T) {
-	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), 10, 5)
+	mm := newMetricsMonitor(config.Config{}, logmon.NewWriter(io.Discard), 10, 5)
 
 	// No Content-Encoding: body returned unchanged.
 	w := httptest.NewRecorder()
@@ -273,12 +323,81 @@ func TestServer_ParseMetrics_Infill(t *testing.T) {
 	}
 }
 
+func TestServer_MetricsMiddleware_RecordsRequestedModelAlias(t *testing.T) {
+	cfg, err := config.LoadConfigFromReader(strings.NewReader(`
+models:
+  real:
+    cmd: echo ${PORT}
+    aliases:
+      - alias
+`))
+	if err != nil {
+		t.Fatalf("LoadConfigFromReader: %v", err)
+	}
+	mm := newMetricsMonitor(cfg, logmon.NewWriter(io.Discard), 100, 0)
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2}}`))
+	})
+	handler := CreateMetricsMiddleware(mm, cfg)(inner)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"alias"}`))
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	entries := mm.getMetrics()
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	if entries[0].Model != "alias" {
+		t.Fatalf("model = %q, want alias", entries[0].Model)
+	}
+}
+
+func TestServer_MetricsMiddleware_RequestsStreamingUsage(t *testing.T) {
+	cfg := config.Config{Models: map[string]config.ModelConfig{"m": {}}}
+	mm := newMetricsMonitor(cfg, logmon.NewWriter(io.Discard), 100, 0)
+	var sawStreamingUsage bool
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read body: %v", err)
+		}
+		sawStreamingUsage = strings.Contains(string(body), `"stream_options":{"include_usage":true}`)
+
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n" +
+			"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":8}}\n\n" +
+			"data: [DONE]\n\n"))
+	})
+	handler := CreateMetricsMiddleware(mm, cfg)(inner)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	if !sawStreamingUsage {
+		t.Fatal("stream_options.include_usage was not injected")
+	}
+	entries := mm.getMetrics()
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	if entries[0].Tokens.InputTokens != 12 || entries[0].Tokens.OutputTokens != 8 {
+		t.Fatalf("tokens = %+v", entries[0].Tokens)
+	}
+}
+
 // TestServer_MetricsMiddleware_UpstreamAudioCaptureSkipsRespBody verifies that
 // an /upstream/<model>/v1/audio/speech request uses the path-specific capture
 // mask (headers only) rather than falling back to captureAll.
 func TestServer_MetricsMiddleware_UpstreamAudioCaptureSkipsRespBody(t *testing.T) {
-	mm := newMetricsMonitor(logmon.NewWriter(io.Discard), 100, 5)
 	cfg := config.Config{Models: map[string]config.ModelConfig{"m1": {}}}
+	mm := newMetricsMonitor(cfg, logmon.NewWriter(io.Discard), 100, 5)
 
 	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "audio/mpeg")

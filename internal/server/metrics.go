@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/cache"
+	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/event"
 	"github.com/mostlygeek/llama-swap/internal/logmon"
 	"github.com/mostlygeek/llama-swap/internal/ring"
@@ -61,6 +62,7 @@ func (e ActivityLogEvent) Type() uint32 {
 // bounded in-memory ring of recent activity, and (when captures are enabled)
 // stores zstd+CBOR-compressed request/response captures in a sized cache.
 type metricsMonitor struct {
+	cfg     config.Config
 	mu      sync.RWMutex
 	metrics ring.Buffer[ActivityLogEntry]
 	nextID  int
@@ -72,11 +74,12 @@ type metricsMonitor struct {
 
 // newMetricsMonitor creates a metricsMonitor retaining up to maxMetrics entries.
 // captureBufferMB is the capture buffer size in megabytes; 0 disables captures.
-func newMetricsMonitor(logger *logmon.Monitor, maxMetrics int, captureBufferMB int) *metricsMonitor {
+func newMetricsMonitor(cfg config.Config, logger *logmon.Monitor, maxMetrics int, captureBufferMB int) *metricsMonitor {
 	if maxMetrics <= 0 {
 		maxMetrics = 1000
 	}
 	mm := &metricsMonitor{
+		cfg:            cfg,
 		logger:         logger,
 		metrics:        ring.NewBuffer[ActivityLogEntry](maxMetrics),
 		enableCaptures: captureBufferMB > 0,
@@ -93,6 +96,9 @@ func (mp *metricsMonitor) queueMetrics(metric ActivityLogEntry) int {
 	defer mp.mu.Unlock()
 
 	metric.ID = mp.nextID
+	if modelConfig, ok := mp.cfg.Models[metric.Model]; ok && len(modelConfig.Aliases) > 0 {
+		metric.Model = modelConfig.Aliases[0]
+	}
 	mp.nextID++
 	mp.metrics.Push(metric)
 	return metric.ID
@@ -131,14 +137,14 @@ func (mp *metricsMonitor) getMetricsJSON() ([]byte, error) {
 // request only and set ErrorMsg to a description of the failure, so the error
 // can be inspected without storing unreadable raw response bytes. reqBody and
 // reqHeaders are the request data buffered before dispatch.
-func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string) {
+func (mp *metricsMonitor) record(modelID string, requestStart time.Time, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string) {
 	tm := ActivityLogEntry{
 		Timestamp:       time.Now(),
 		Model:           modelID,
 		ReqPath:         r.URL.Path,
 		RespContentType: recorder.Header().Get("Content-Type"),
 		RespStatusCode:  recorder.Status(),
-		DurationMs:      int(time.Since(recorder.StartTime()).Milliseconds()),
+		DurationMs:      int(time.Since(requestStart).Milliseconds()),
 	}
 
 	if ctxData, ok := shared.ReadContext(r.Context()); ok && len(ctxData.Metadata) > 0 {
@@ -184,7 +190,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 	}
 
 	if strings.Contains(recorder.Header().Get("Content-Type"), "text/event-stream") {
-		if parsed, err := processStreamingResponse(modelID, recorder.StartTime(), body); err != nil {
+		if parsed, err := processStreamingResponse(modelID, requestStart, body); err != nil {
 			mp.logger.Warnf("error processing streaming response: %v, path=%s, recording minimal metrics", err, r.URL.Path)
 		} else {
 			tm.Tokens = parsed.Tokens
@@ -203,7 +209,7 @@ func (mp *metricsMonitor) record(modelID string, r *http.Request, recorder *resp
 		}
 
 		if usage.Exists() || timings.Exists() {
-			if parsedMetrics, err := parseMetrics(modelID, recorder.StartTime(), usage, timings); err != nil {
+			if parsedMetrics, err := parseMetrics(modelID, requestStart, usage, timings); err != nil {
 				mp.logger.Warnf("error parsing metrics: %v, path=%s, recording minimal metrics", err, r.URL.Path)
 			} else {
 				tm.Tokens = parsedMetrics.Tokens
@@ -446,6 +452,14 @@ func buildMetrics(modelID string, start time.Time, inputTokens, outputTokens, ca
 		if timings.Get("draft_n").Exists() && timings.Get("draft_n_accepted").Exists() {
 			draftTokens = int(timings.Get("draft_n").Int())
 			draftAccTokens = int(timings.Get("draft_n_accepted").Int())
+		}
+	} else if wallDurationMs > 0 {
+		wallSeconds := float64(wallDurationMs) / 1000.0
+		if inputTokens > 0 {
+			promptPerSecond = float64(inputTokens) / wallSeconds
+		}
+		if outputTokens > 0 {
+			tokensPerSecond = float64(outputTokens) / wallSeconds
 		}
 	}
 

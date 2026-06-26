@@ -150,7 +150,7 @@ func upstreamMetricsServer(response string) *Server {
 		proxylog:    proxylog,
 		upstreamlog: logmon.NewWriter(io.Discard),
 		inflight:    &inflightCounter{},
-		metrics:     newMetricsMonitor(proxylog, 10, 0),
+		metrics:     newMetricsMonitor(config.Config{}, proxylog, 10, 0),
 		local:       newStubRouter([]string{"m1"}, response),
 		peer:        newStubRouter(nil, ""),
 	}

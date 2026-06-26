@@ -4,11 +4,14 @@ import (
 	"bytes"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/chain"
 	"github.com/mostlygeek/llama-swap/internal/config"
 	"github.com/mostlygeek/llama-swap/internal/shared"
+	"github.com/tidwall/sjson"
 )
 
 // CreateMetricsMiddleware returns middleware that records token metrics for
@@ -49,6 +52,12 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 				return
 			}
 
+			if shouldRequestStreamingUsage(checkPath, data, r) {
+				if err := requestStreamingUsage(r); err != nil && mm.logger != nil {
+					mm.logger.Warnf("metrics: failed to request streaming usage: %v", err)
+				}
+			}
+
 			// Buffer the request body/headers for capture before dispatch
 			// consumes them.
 			cf := captureFieldsFor(checkPath)
@@ -74,9 +83,36 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 				r.Header.Set("Accept-Encoding", filterAcceptEncoding(ae))
 			}
 
+			requestStart := time.Now()
 			recorder := newBodyCopier(w)
 			next.ServeHTTP(recorder, r)
-			mm.record(data.ModelID, r, recorder, cf, reqBody, reqHeaders)
+			mm.record(data.ModelID, requestStart, r, recorder, cf, reqBody, reqHeaders)
 		})
 	}
+}
+
+func shouldRequestStreamingUsage(path string, data shared.ReqContextData, r *http.Request) bool {
+	return data.Streaming &&
+		path == "/v1/chat/completions" &&
+		strings.Contains(r.Header.Get("Content-Type"), "application/json")
+}
+
+func requestStreamingUsage(r *http.Request) error {
+	body, err := io.ReadAll(r.Body)
+	if err != nil {
+		return err
+	}
+	r.Body.Close()
+
+	body, err = sjson.SetBytes(body, "stream_options.include_usage", true)
+	if err != nil {
+		r.Body = io.NopCloser(bytes.NewReader(body))
+		return err
+	}
+
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.Header.Del("Transfer-Encoding")
+	r.Header.Set("Content-Length", strconv.Itoa(len(body)))
+	r.ContentLength = int64(len(body))
+	return nil
 }
