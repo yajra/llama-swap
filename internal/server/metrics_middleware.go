@@ -17,7 +17,7 @@ import (
 // CreateMetricsMiddleware returns middleware that records token metrics for
 // model-dispatched POST requests. It resolves the model, tees the response into
 // a buffer, and parses token usage once the upstream handler returns.
-func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middleware {
+func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config, modelLogHistory modelLogHistoryFunc) chain.Middleware {
 	return func(next http.Handler) http.Handler {
 		return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 			if mm == nil || r.Method != http.MethodPost {
@@ -84,11 +84,36 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config) chain.Middle
 			}
 
 			requestStart := time.Now()
+			logBefore := getModelLogHistory(modelLogHistory, data.ModelID)
 			recorder := newBodyCopier(w)
 			next.ServeHTTP(recorder, r)
-			mm.record(data.ModelID, requestStart, r, recorder, cf, reqBody, reqHeaders)
+			logAfter := getModelLogHistory(modelLogHistory, data.ModelID)
+			specMetrics, _ := parseSpecDecodingMetrics(logHistoryDelta(logBefore, logAfter))
+			mm.record(data.ModelID, requestStart, r, recorder, cf, reqBody, reqHeaders, specMetrics)
 		})
 	}
+}
+
+type modelLogHistoryFunc func(modelID string) []byte
+
+func getModelLogHistory(fn modelLogHistoryFunc, modelID string) []byte {
+	if fn == nil {
+		return nil
+	}
+	return fn(modelID)
+}
+
+func logHistoryDelta(before, after []byte) []byte {
+	if len(after) == 0 {
+		return nil
+	}
+	if len(before) == 0 {
+		return after
+	}
+	if bytes.HasPrefix(after, before) {
+		return after[len(before):]
+	}
+	return after
 }
 
 func shouldRequestStreamingUsage(path string, data shared.ReqContextData, r *http.Request) bool {

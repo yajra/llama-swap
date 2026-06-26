@@ -201,7 +201,7 @@ func (s *Server) routes() {
 		CreateFilterMiddleware(s.cfg),
 		CreateFormFilterMiddleware(s.cfg),
 		CreateInflightMiddleware(s.inflight),
-		CreateMetricsMiddleware(s.metrics, s.cfg),
+		CreateMetricsMiddleware(s.metrics, s.cfg, s.modelLogHistory),
 	)
 	// Custom endpoints only need auth.
 	apiChain := chain.New(authMW)
@@ -242,7 +242,7 @@ func (s *Server) routes() {
 
 	// Upstream passthrough. Meter only the model-dispatched endpoints that can
 	// produce token usage/timings.
-	upstreamChain := apiChain.Append(CreateMetricsMiddleware(s.metrics, s.cfg))
+	upstreamChain := apiChain.Append(CreateMetricsMiddleware(s.metrics, s.cfg, s.modelLogHistory))
 	mux.HandleFunc("GET /upstream", handleUpstreamRedirect)
 	mux.Handle("/upstream/{upstreamPath...}", upstreamChain.ThenFunc(s.handleUpstream))
 
@@ -261,6 +261,17 @@ func (s *Server) routes() {
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	s.handler.ServeHTTP(w, r)
+}
+
+func (s *Server) modelLogHistory(modelID string) []byte {
+	if s.local == nil {
+		return nil
+	}
+	log, ok := s.local.ProcessLogger(modelID)
+	if !ok || log == nil {
+		return nil
+	}
+	return log.GetHistory()
 }
 
 // CloseStreams cancels long-lived response streams (Server-Sent Events) so a

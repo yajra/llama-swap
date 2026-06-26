@@ -94,6 +94,19 @@ func TestServer_ProcessStreamingResponse_NoData(t *testing.T) {
 	}
 }
 
+func TestServer_ParseSpecDecodingMetrics(t *testing.T) {
+	logData := []byte(`(APIServer pid=267) INFO 06-26 10:08:28 [metrics.py:101] SpecDecoding metrics: Mean acceptance length: 3.77, Accepted throughput: 17.70 tokens/s, Drafted throughput: 17.80 tokens/s, Accepted: 177 tokens, Drafted: 178 tokens, Per-position acceptance rate: 0.953, 0.906, 0.906, Avg Draft acceptance rate: 99.4%
+(APIServer pid=267) INFO 06-26 10:08:38 [metrics.py:101] SpecDecoding metrics: Mean acceptance length: 4.00, Accepted throughput: 20.70 tokens/s, Drafted throughput: 20.70 tokens/s, Accepted: 207 tokens, Drafted: 207 tokens, Per-position acceptance rate: 1.000, 1.000, 1.000, Avg Draft acceptance rate: 100.0%`)
+
+	got, ok := parseSpecDecodingMetrics(logData)
+	if !ok {
+		t.Fatal("expected spec decoding metrics")
+	}
+	if got.AcceptedTokens != 384 || got.DraftedTokens != 385 {
+		t.Fatalf("metrics = %+v, want accepted=384 drafted=385", got)
+	}
+}
+
 func TestMetricsMonitor_QueueMetrics_ResolvesFirstAlias(t *testing.T) {
 	mm := newMetricsMonitor(config.Config{Models: map[string]config.ModelConfig{
 		"real": {Aliases: []string{"alias", "second-alias"}},
@@ -126,7 +139,7 @@ func TestMetricsMonitor_RecordMetadata(t *testing.T) {
 	copier.WriteHeader(http.StatusOK)
 	copier.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2}}`))
 
-	mm.record("m", copier.StartTime(), r, copier, 0, nil, nil)
+	mm.record("m", copier.StartTime(), r, copier, 0, nil, nil, specDecodingMetrics{})
 
 	entries := mm.getMetrics()
 	if len(entries) != 1 {
@@ -152,7 +165,7 @@ func TestMetricsMonitor_RecordFailedRequestCapture(t *testing.T) {
 	copier.Write([]byte(`{"error":{"message":"model unavailable"}}`))
 
 	reqBody := []byte(`{"model":"m","messages":[]}`)
-	mm.record("m", copier.StartTime(), r, copier, captureAll, reqBody, reqHeaders)
+	mm.record("m", copier.StartTime(), r, copier, captureAll, reqBody, reqHeaders, specDecodingMetrics{})
 
 	entries := mm.getMetrics()
 	if len(entries) != 1 {
@@ -194,7 +207,7 @@ func TestMetricsMonitor_RecordFailedRequestStatusFallback(t *testing.T) {
 	copier.WriteHeader(http.StatusBadGateway)
 	copier.Write([]byte("<html>upstream down</html>"))
 
-	mm.record("m", copier.StartTime(), r, copier, captureAll, nil, nil)
+	mm.record("m", copier.StartTime(), r, copier, captureAll, nil, nil, specDecodingMetrics{})
 
 	entries := mm.getMetrics()
 	if len(entries) != 1 {
@@ -214,7 +227,7 @@ func TestMetricsMonitor_RecordFailedRequestCaptureDisabled(t *testing.T) {
 	copier.WriteHeader(http.StatusInternalServerError)
 	copier.Write([]byte(`{"error":"boom"}`))
 
-	mm.record("m", copier.StartTime(), r, copier, captureAll, []byte("req"), nil)
+	mm.record("m", copier.StartTime(), r, copier, captureAll, []byte("req"), nil, specDecodingMetrics{})
 
 	entries := mm.getMetrics()
 	if len(entries) != 1 {
@@ -242,7 +255,7 @@ func TestMetricsMonitor_RecordDecompressionFailureSetsErrorMsg(t *testing.T) {
 	copier.WriteHeader(http.StatusOK)
 	copier.Write([]byte("not-really-gzip"))
 
-	mm.record("m", copier.StartTime(), r, copier, captureAll, []byte("req"), nil)
+	mm.record("m", copier.StartTime(), r, copier, captureAll, []byte("req"), nil, specDecodingMetrics{})
 
 	entries := mm.getMetrics()
 	if len(entries) != 1 {
@@ -341,7 +354,7 @@ models:
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte(`{"usage":{"prompt_tokens":1,"completion_tokens":2}}`))
 	})
-	handler := CreateMetricsMiddleware(mm, cfg)(inner)
+	handler := CreateMetricsMiddleware(mm, cfg, nil)(inner)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"alias"}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -374,7 +387,7 @@ func TestServer_MetricsMiddleware_RequestsStreamingUsage(t *testing.T) {
 			"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":8}}\n\n" +
 			"data: [DONE]\n\n"))
 	})
-	handler := CreateMetricsMiddleware(mm, cfg)(inner)
+	handler := CreateMetricsMiddleware(mm, cfg, nil)(inner)
 
 	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hello"}]}`))
 	req.Header.Set("Content-Type", "application/json")
@@ -392,6 +405,39 @@ func TestServer_MetricsMiddleware_RequestsStreamingUsage(t *testing.T) {
 	}
 }
 
+func TestServer_MetricsMiddleware_CapturesSpecDecodingMetrics(t *testing.T) {
+	cfg := config.Config{Models: map[string]config.ModelConfig{"m": {}}}
+	mm := newMetricsMonitor(cfg, logmon.NewWriter(io.Discard), 100, 0)
+	history := []byte("before\n")
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		history = append(history, []byte("(APIServer pid=267) INFO 06-26 10:08:28 [metrics.py:101] SpecDecoding metrics: Mean acceptance length: 3.77, Accepted throughput: 17.70 tokens/s, Drafted throughput: 17.80 tokens/s, Accepted: 177 tokens, Drafted: 178 tokens, Per-position acceptance rate: 0.953, 0.906, 0.906, Avg Draft acceptance rate: 99.4%\n")...)
+		w.Header().Set("Content-Type", "text/event-stream")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte("data: {\"choices\":[{\"delta\":{\"content\":\"hello\"}}]}\n\n" +
+			"data: {\"choices\":[],\"usage\":{\"prompt_tokens\":12,\"completion_tokens\":8}}\n\n" +
+			"data: [DONE]\n\n"))
+	})
+	handler := CreateMetricsMiddleware(mm, cfg, func(modelID string) []byte {
+		if modelID != "m" {
+			t.Fatalf("modelID = %q, want m", modelID)
+		}
+		return history
+	})(inner)
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","stream":true,"messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	entries := mm.getMetrics()
+	if len(entries) != 1 {
+		t.Fatalf("want 1 entry, got %d", len(entries))
+	}
+	if entries[0].Tokens.DraftTokens != 178 || entries[0].Tokens.DraftAccTokens != 177 {
+		t.Fatalf("draft tokens = %+v, want drafted=178 accepted=177", entries[0].Tokens)
+	}
+}
+
 // TestServer_MetricsMiddleware_UpstreamAudioCaptureSkipsRespBody verifies that
 // an /upstream/<model>/v1/audio/speech request uses the path-specific capture
 // mask (headers only) rather than falling back to captureAll.
@@ -404,7 +450,7 @@ func TestServer_MetricsMiddleware_UpstreamAudioCaptureSkipsRespBody(t *testing.T
 		w.WriteHeader(http.StatusOK)
 		w.Write([]byte("BINARY-AUDIO-DATA"))
 	})
-	handler := CreateMetricsMiddleware(mm, cfg)(inner)
+	handler := CreateMetricsMiddleware(mm, cfg, nil)(inner)
 
 	req := httptest.NewRequest(http.MethodPost, "/upstream/m1/v1/audio/speech", strings.NewReader(`{"model":"m1"}`))
 	handler.ServeHTTP(httptest.NewRecorder(), req)

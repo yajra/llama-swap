@@ -10,6 +10,8 @@ import (
 	"io"
 	"net"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -56,6 +58,42 @@ type ActivityLogEvent struct {
 
 func (e ActivityLogEvent) Type() uint32 {
 	return shared.ActivityLogEventID
+}
+
+type specDecodingMetrics struct {
+	DraftedTokens  int
+	AcceptedTokens int
+}
+
+var specDecodingMetricsRe = regexp.MustCompile(`SpecDecoding metrics:.*Accepted:\s*([0-9]+)\s*tokens,\s*Drafted:\s*([0-9]+)\s*tokens`)
+
+func parseSpecDecodingMetrics(logData []byte) (specDecodingMetrics, bool) {
+	var metrics specDecodingMetrics
+	for _, match := range specDecodingMetricsRe.FindAllSubmatch(logData, -1) {
+		accepted, err := strconv.Atoi(string(match[1]))
+		if err != nil {
+			continue
+		}
+		drafted, err := strconv.Atoi(string(match[2]))
+		if err != nil {
+			continue
+		}
+		metrics.AcceptedTokens += accepted
+		metrics.DraftedTokens += drafted
+	}
+	return metrics, metrics.DraftedTokens > 0
+}
+
+func applySpecDecodingMetrics(tm *ActivityLogEntry, metrics specDecodingMetrics) {
+	if metrics.DraftedTokens <= 0 {
+		return
+	}
+	if tm.Tokens.DraftTokens <= 0 {
+		tm.Tokens.DraftTokens = metrics.DraftedTokens
+	}
+	if tm.Tokens.DraftAccTokens <= 0 {
+		tm.Tokens.DraftAccTokens = metrics.AcceptedTokens
+	}
 }
 
 // metricsMonitor parses upstream responses for token statistics, keeps a
@@ -137,7 +175,7 @@ func (mp *metricsMonitor) getMetricsJSON() ([]byte, error) {
 // request only and set ErrorMsg to a description of the failure, so the error
 // can be inspected without storing unreadable raw response bytes. reqBody and
 // reqHeaders are the request data buffered before dispatch.
-func (mp *metricsMonitor) record(modelID string, requestStart time.Time, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string) {
+func (mp *metricsMonitor) record(modelID string, requestStart time.Time, r *http.Request, recorder *responseBodyCopier, cf captureFields, reqBody []byte, reqHeaders map[string]string, specMetrics specDecodingMetrics) {
 	tm := ActivityLogEntry{
 		Timestamp:       time.Now(),
 		Model:           modelID,
@@ -155,6 +193,7 @@ func (mp *metricsMonitor) record(modelID string, requestStart time.Time, r *http
 	}
 
 	queueAndEmit := func() {
+		applySpecDecodingMetrics(&tm, specMetrics)
 		tm.ID = mp.queueMetrics(tm)
 		mp.emitMetric(tm)
 	}
@@ -220,6 +259,7 @@ func (mp *metricsMonitor) record(modelID string, requestStart time.Time, r *http
 		mp.logger.Warnf("metrics: invalid JSON in response body path=%s, recording minimal metrics", r.URL.Path)
 	}
 
+	applySpecDecodingMetrics(&tm, specMetrics)
 	tm.ID = mp.queueMetrics(tm)
 	tm.HasCapture = mp.storeCapture(tm.ID, r, recorder, cf, reqBody, reqHeaders, body)
 	mp.emitMetric(tm)
