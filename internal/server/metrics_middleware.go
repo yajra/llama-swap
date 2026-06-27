@@ -14,6 +14,11 @@ import (
 	"github.com/tidwall/sjson"
 )
 
+var (
+	specDecodingLogGrace        = 2500 * time.Millisecond
+	specDecodingLogPollInterval = 50 * time.Millisecond
+)
+
 // CreateMetricsMiddleware returns middleware that records token metrics for
 // model-dispatched POST requests. It resolves the model, tees the response into
 // a buffer, and parses token usage once the upstream handler returns.
@@ -89,6 +94,15 @@ func CreateMetricsMiddleware(mm *metricsMonitor, cfg config.Config, modelLogHist
 			next.ServeHTTP(recorder, r)
 			logAfter := getModelLogHistory(modelLogHistory, data.ModelID)
 			specMetrics, _ := parseSpecDecodingMetrics(logHistoryDelta(logBefore, logAfter))
+			if shouldWaitForSpecDecodingLogs(logAfter, specMetrics) {
+				recordReq := cloneRequestForMetrics(r)
+				recordRecorder := cloneResponseBodyCopier(recorder)
+				go func() {
+					specMetrics := collectSpecDecodingMetrics(modelLogHistory, data.ModelID, logBefore, specDecodingLogGrace)
+					mm.record(data.ModelID, requestStart, recordReq, recordRecorder, cf, reqBody, reqHeaders, specMetrics)
+				}()
+				return
+			}
 			mm.record(data.ModelID, requestStart, r, recorder, cf, reqBody, reqHeaders, specMetrics)
 		})
 	}
@@ -113,7 +127,86 @@ func logHistoryDelta(before, after []byte) []byte {
 	if bytes.HasPrefix(after, before) {
 		return after[len(before):]
 	}
+	maxOverlap := min(len(before), len(after))
+	for n := maxOverlap; n > 0; n-- {
+		if bytes.HasPrefix(after, before[len(before)-n:]) {
+			return after[n:]
+		}
+	}
 	return after
+}
+
+func shouldWaitForSpecDecodingLogs(logHistory []byte, metrics specDecodingMetrics) bool {
+	if specDecodingLogGrace <= 0 || len(logHistory) == 0 {
+		return false
+	}
+	return metrics.DraftedTokens > 0 ||
+		bytes.Contains(logHistory, []byte("SpecDecoding metrics:")) ||
+		bytes.Contains(logHistory, []byte("SpeculativeConfig")) ||
+		bytes.Contains(logHistory, []byte("speculative_config"))
+}
+
+func collectSpecDecodingMetrics(modelLogHistory modelLogHistoryFunc, modelID string, logBefore []byte, grace time.Duration) specDecodingMetrics {
+	if modelLogHistory == nil || grace <= 0 {
+		metrics, _ := parseSpecDecodingMetrics(logHistoryDelta(logBefore, getModelLogHistory(modelLogHistory, modelID)))
+		return metrics
+	}
+
+	var metrics specDecodingMetrics
+	lastHistory := logBefore
+	deadline := time.Now().Add(grace)
+	for {
+		currentHistory := getModelLogHistory(modelLogHistory, modelID)
+		if parsed, ok := parseSpecDecodingMetrics(logHistoryDelta(lastHistory, currentHistory)); ok {
+			metrics.AcceptedTokens += parsed.AcceptedTokens
+			metrics.DraftedTokens += parsed.DraftedTokens
+		}
+		lastHistory = currentHistory
+
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			return metrics
+		}
+		sleepFor := specDecodingLogPollInterval
+		if sleepFor <= 0 || sleepFor > remaining {
+			sleepFor = remaining
+		}
+		time.Sleep(sleepFor)
+	}
+}
+
+type metricsResponseWriter struct {
+	header http.Header
+}
+
+func (w *metricsResponseWriter) Header() http.Header {
+	return w.header
+}
+
+func (w *metricsResponseWriter) Write(b []byte) (int, error) {
+	return len(b), nil
+}
+
+func (w *metricsResponseWriter) WriteHeader(statusCode int) {}
+
+func cloneRequestForMetrics(r *http.Request) *http.Request {
+	clone := r.Clone(r.Context())
+	clone.Header = r.Header.Clone()
+	if r.URL != nil {
+		urlCopy := *r.URL
+		clone.URL = &urlCopy
+	}
+	return clone
+}
+
+func cloneResponseBodyCopier(recorder *responseBodyCopier) *responseBodyCopier {
+	return &responseBodyCopier{
+		ResponseWriter: &metricsResponseWriter{header: recorder.Header().Clone()},
+		body:           bytes.NewBuffer(append([]byte(nil), recorder.body.Bytes()...)),
+		status:         recorder.status,
+		wroteHeader:    recorder.wroteHeader,
+		start:          recorder.start,
+	}
 }
 
 func shouldRequestStreamingUsage(path string, data shared.ReqContextData, r *http.Request) bool {

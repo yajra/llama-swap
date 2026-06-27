@@ -5,6 +5,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -104,6 +105,114 @@ func TestServer_ParseSpecDecodingMetrics(t *testing.T) {
 	}
 	if got.AcceptedTokens != 384 || got.DraftedTokens != 385 {
 		t.Fatalf("metrics = %+v, want accepted=384 drafted=385", got)
+	}
+}
+
+func TestServer_ParseSpecDecodingMetrics_ActualVLLMLogs(t *testing.T) {
+	logData := []byte(`(APIServer pid=222) INFO 06-27 02:54:51 [metrics.py:101] SpecDecoding metrics: Mean acceptance length: 3.93, Accepted throughput: 64.69 tokens/s, Drafted throughput: 64.59 tokens/s, Accepted: 647 tokens, Drafted: 646 tokens, Per-position acceptance rate: 0.982, 0.973, 0.973, Avg Draft acceptance rate: 100.2%
+(APIServer pid=222) INFO 06-27 02:55:01 [metrics.py:101] SpecDecoding metrics: Mean acceptance length: 3.99, Accepted throughput: 94.29 tokens/s, Drafted throughput: 94.49 tokens/s, Accepted: 943 tokens, Drafted: 945 tokens, Per-position acceptance rate: 1.000, 1.000, 0.994, Avg Draft acceptance rate: 99.8%`)
+
+	got, ok := parseSpecDecodingMetrics(logData)
+	if !ok {
+		t.Fatal("expected spec decoding metrics")
+	}
+	if got.AcceptedTokens != 1590 || got.DraftedTokens != 1591 {
+		t.Fatalf("metrics = %+v, want accepted=1590 drafted=1591", got)
+	}
+}
+
+func withSpecDecodingLogTiming(t *testing.T, grace, poll time.Duration) {
+	t.Helper()
+	oldGrace := specDecodingLogGrace
+	oldPoll := specDecodingLogPollInterval
+	specDecodingLogGrace = grace
+	specDecodingLogPollInterval = poll
+	t.Cleanup(func() {
+		specDecodingLogGrace = oldGrace
+		specDecodingLogPollInterval = oldPoll
+	})
+}
+
+func waitForMetrics(t *testing.T, mm *metricsMonitor, want int) []ActivityLogEntry {
+	t.Helper()
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for {
+		entries := mm.getMetrics()
+		if len(entries) == want {
+			return entries
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("want %d metrics, got %d", want, len(entries))
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+}
+
+func TestServer_LogHistoryDelta(t *testing.T) {
+	cases := []struct {
+		name   string
+		before string
+		after  string
+		want   string
+	}{
+		{
+			name:   "prefix",
+			before: "before\n",
+			after:  "before\nafter\n",
+			want:   "after\n",
+		},
+		{
+			name:   "rotated overlap",
+			before: "old\nshared\n",
+			after:  "shared\nnew\n",
+			want:   "new\n",
+		},
+		{
+			name:   "no overlap",
+			before: "old\n",
+			after:  "new\n",
+			want:   "new\n",
+		},
+		{
+			name:   "empty before",
+			before: "",
+			after:  "all\n",
+			want:   "all\n",
+		},
+		{
+			name:   "empty after",
+			before: "before\n",
+			after:  "",
+			want:   "",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := string(logHistoryDelta([]byte(tc.before), []byte(tc.after)))
+			if got != tc.want {
+				t.Fatalf("delta = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestServer_CollectSpecDecodingMetrics_DoesNotDoubleCountPolls(t *testing.T) {
+	withSpecDecodingLogTiming(t, 30*time.Millisecond, time.Millisecond)
+
+	history := []byte("before\n")
+	logBefore := append([]byte(nil), history...)
+	history = append(history, []byte("(APIServer pid=222) INFO 06-27 02:55:01 [metrics.py:101] SpecDecoding metrics: Mean acceptance length: 3.99, Accepted throughput: 94.29 tokens/s, Drafted throughput: 94.49 tokens/s, Accepted: 943 tokens, Drafted: 945 tokens, Per-position acceptance rate: 1.000, 1.000, 0.994, Avg Draft acceptance rate: 99.8%\n")...)
+
+	got := collectSpecDecodingMetrics(func(modelID string) []byte {
+		if modelID != "m" {
+			t.Fatalf("modelID = %q, want m", modelID)
+		}
+		return history
+	}, "m", logBefore, 10*time.Millisecond)
+
+	if got.AcceptedTokens != 943 || got.DraftedTokens != 945 {
+		t.Fatalf("metrics = %+v, want accepted=943 drafted=945", got)
 	}
 }
 
@@ -406,6 +515,8 @@ func TestServer_MetricsMiddleware_RequestsStreamingUsage(t *testing.T) {
 }
 
 func TestServer_MetricsMiddleware_CapturesSpecDecodingMetrics(t *testing.T) {
+	withSpecDecodingLogTiming(t, 10*time.Millisecond, time.Millisecond)
+
 	cfg := config.Config{Models: map[string]config.ModelConfig{"m": {}}}
 	mm := newMetricsMonitor(cfg, logmon.NewWriter(io.Discard), 100, 0)
 	history := []byte("before\n")
@@ -429,12 +540,48 @@ func TestServer_MetricsMiddleware_CapturesSpecDecodingMetrics(t *testing.T) {
 	req.Header.Set("Content-Type", "application/json")
 	handler.ServeHTTP(httptest.NewRecorder(), req)
 
-	entries := mm.getMetrics()
-	if len(entries) != 1 {
-		t.Fatalf("want 1 entry, got %d", len(entries))
-	}
+	entries := waitForMetrics(t, mm, 1)
 	if entries[0].Tokens.DraftTokens != 178 || entries[0].Tokens.DraftAccTokens != 177 {
 		t.Fatalf("draft tokens = %+v, want drafted=178 accepted=177", entries[0].Tokens)
+	}
+}
+
+func TestServer_MetricsMiddleware_CapturesLateSpecDecodingMetrics(t *testing.T) {
+	withSpecDecodingLogTiming(t, 80*time.Millisecond, time.Millisecond)
+
+	cfg := config.Config{Models: map[string]config.ModelConfig{"m": {}}}
+	mm := newMetricsMonitor(cfg, logmon.NewWriter(io.Discard), 100, 0)
+	var mu sync.Mutex
+	history := []byte("speculative_config=SpeculativeConfig\n")
+
+	inner := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"usage":{"prompt_tokens":12,"completion_tokens":8}}`))
+	})
+	handler := CreateMetricsMiddleware(mm, cfg, func(modelID string) []byte {
+		if modelID != "m" {
+			t.Fatalf("modelID = %q, want m", modelID)
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]byte(nil), history...)
+	})(inner)
+
+	go func() {
+		time.Sleep(20 * time.Millisecond)
+		mu.Lock()
+		defer mu.Unlock()
+		history = append(history, []byte("(APIServer pid=222) INFO 06-27 02:56:01 [metrics.py:101] SpecDecoding metrics: Mean acceptance length: 3.93, Accepted throughput: 78.09 tokens/s, Drafted throughput: 78.49 tokens/s, Accepted: 781 tokens, Drafted: 785 tokens, Per-position acceptance rate: 0.981, 0.974, 0.970, Avg Draft acceptance rate: 99.5%\n")...)
+	}()
+
+	req := httptest.NewRequest(http.MethodPost, "/v1/chat/completions", strings.NewReader(`{"model":"m","messages":[{"role":"user","content":"hello"}]}`))
+	req.Header.Set("Content-Type", "application/json")
+	handler.ServeHTTP(httptest.NewRecorder(), req)
+
+	entries := waitForMetrics(t, mm, 1)
+	if entries[0].Tokens.DraftTokens != 785 || entries[0].Tokens.DraftAccTokens != 781 {
+		t.Fatalf("draft tokens = %+v, want drafted=785 accepted=781", entries[0].Tokens)
 	}
 }
 
