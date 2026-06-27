@@ -8,6 +8,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"time"
 
 	"github.com/mostlygeek/llama-swap/internal/event"
@@ -191,6 +192,36 @@ type messageEnvelope struct {
 	Data string      `json:"data"`
 }
 
+const apiEventsSendBufferSize = 1024
+
+type apiEventSender struct {
+	ctx        context.Context
+	sendBuffer chan<- messageEnvelope
+	dropped    atomic.Uint64
+}
+
+func newAPIEventSender(ctx context.Context, sendBuffer chan<- messageEnvelope) *apiEventSender {
+	return &apiEventSender{ctx: ctx, sendBuffer: sendBuffer}
+}
+
+func (sender *apiEventSender) send(msg messageEnvelope) {
+	if sender.ctx.Err() != nil {
+		return
+	}
+
+	select {
+	case sender.sendBuffer <- msg:
+	default:
+		if sender.ctx.Err() == nil {
+			sender.dropped.Add(1)
+		}
+	}
+}
+
+func (sender *apiEventSender) droppedCount() uint64 {
+	return sender.dropped.Load()
+}
+
 // handleAPIEvents streams server events (model status, log data, metrics,
 // in-flight counts) to the client as Server-Sent Events.
 func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
@@ -207,20 +238,14 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// internal/event already has a 50K event buffer
-	// a 1K message buffer should be enough, watch the logs for the warning that the sendBuffer is full
-	sendBuffer := make(chan messageEnvelope, 1024)
+	// Keep a per-client buffer so event publishers are not blocked by slow SSE
+	// clients. When it fills, events are dropped and reported once on cleanup.
+	sendBuffer := make(chan messageEnvelope, apiEventsSendBufferSize)
 	ctx, cancel := context.WithCancel(r.Context())
-	defer cancel()
+	sender := newAPIEventSender(ctx, sendBuffer)
 
 	send := func(msg messageEnvelope) {
-		select {
-		case sendBuffer <- msg:
-		case <-ctx.Done():
-			s.proxylog.Warn("handleAPIEvents send suppressed due to context done")
-		default:
-			s.proxylog.Warn("handleAPIEvents sendBuffer full, dropped message")
-		}
+		sender.send(msg)
 	}
 	sendModels := func() {
 		if data, err := json.Marshal(s.modelStatus()); err == nil {
@@ -243,12 +268,25 @@ func (s *Server) handleAPIEvents(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	defer event.On(func(e shared.ProcessStateChangeEvent) { sendModels() })()
-	defer event.On(func(e shared.ConfigFileChangedEvent) { sendModels() })()
-	defer s.proxylog.OnLogData(func(data []byte) { sendLogData("proxy", data) })()
-	defer s.upstreamlog.OnLogData(func(data []byte) { sendLogData("upstream", data) })()
-	defer event.On(func(e ActivityLogEvent) { sendMetrics([]ActivityLogEntry{e.Metrics}) })()
-	defer event.On(func(e shared.InFlightRequestsEvent) { sendInFlight(e.Total) })()
+	cancelProcessStateSub := event.On(func(e shared.ProcessStateChangeEvent) { sendModels() })
+	cancelConfigSub := event.On(func(e shared.ConfigFileChangedEvent) { sendModels() })
+	cancelProxyLogSub := s.proxylog.OnLogData(func(data []byte) { sendLogData("proxy", data) })
+	cancelUpstreamLogSub := s.upstreamlog.OnLogData(func(data []byte) { sendLogData("upstream", data) })
+	cancelMetricsSub := event.On(func(e ActivityLogEvent) { sendMetrics([]ActivityLogEntry{e.Metrics}) })
+	cancelInFlightSub := event.On(func(e shared.InFlightRequestsEvent) { sendInFlight(e.Total) })
+	defer func() {
+		cancel()
+		cancelProcessStateSub()
+		cancelConfigSub()
+		cancelProxyLogSub()
+		cancelUpstreamLogSub()
+		cancelMetricsSub()
+		cancelInFlightSub()
+
+		if dropped := sender.droppedCount(); dropped > 0 {
+			s.proxylog.Warnf("handleAPIEvents dropped %d messages because the client event stream send buffer was full", dropped)
+		}
+	}()
 
 	// initial payload
 	sendLogData("proxy", s.proxylog.GetHistory())

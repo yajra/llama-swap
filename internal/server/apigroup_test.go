@@ -101,3 +101,41 @@ func TestServer_APIEvents_InitialPayload(t *testing.T) {
 		}
 	}
 }
+
+func TestServer_APIEvents_SendSkipsCanceledContext(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	sendBuffer := make(chan messageEnvelope, 1)
+	sender := newAPIEventSender(ctx, sendBuffer)
+
+	cancel()
+	sender.send(messageEnvelope{Type: msgTypeInFlight, Data: `{"total":1}`})
+
+	if got := len(sendBuffer); got != 0 {
+		t.Errorf("sendBuffer length = %d, want 0", got)
+	}
+	if got := sender.droppedCount(); got != 0 {
+		t.Errorf("droppedCount = %d, want 0", got)
+	}
+}
+
+func TestServer_APIEvents_SendCountsFullBuffer(t *testing.T) {
+	ctx := context.Background()
+	sendBuffer := make(chan messageEnvelope, 1)
+	sender := newAPIEventSender(ctx, sendBuffer)
+	original := messageEnvelope{Type: msgTypeModelStatus, Data: "[]"}
+	sendBuffer <- original
+
+	sender.send(messageEnvelope{Type: msgTypeInFlight, Data: `{"total":1}`})
+
+	if got := sender.droppedCount(); got != 1 {
+		t.Errorf("droppedCount = %d, want 1", got)
+	}
+	select {
+	case got := <-sendBuffer:
+		if got != original {
+			t.Errorf("buffer message = %+v, want %+v", got, original)
+		}
+	default:
+		t.Fatal("sendBuffer is empty, want original message preserved")
+	}
+}
